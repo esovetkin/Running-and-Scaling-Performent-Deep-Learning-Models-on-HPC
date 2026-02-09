@@ -1,0 +1,192 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import argparse
+import os
+import runpy
+import signal
+import sys
+import torch
+
+from contextlib import contextmanager
+from pathlib import Path
+from torch.profiler import ProfilerActivity, profile, tensorboard_trace_handler
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Run a Python script under torch.profiler without modifying the script "
+            "source code."
+        )
+    )
+    parser.add_argument(
+        "--logdir",
+        default="runs/torch_profiler",
+        help="TensorBoard output directory (default: runs/torch_profiler).",
+    )
+    parser.add_argument(
+        "--cpu-only",
+        action="store_true",
+        help="Profile CPU activity only, even when CUDA is available.",
+    )
+    parser.add_argument(
+        "--record-shapes",
+        action="store_true",
+        help="Record tensor shapes for operations.",
+    )
+    parser.add_argument(
+        "--profile-memory",
+        action="store_true",
+        help="Record memory usage in the profiler trace.",
+    )
+    parser.add_argument(
+        "--with-stack",
+        action="store_true",
+        help="Record operator call stacks (adds overhead).",
+    )
+    parser.add_argument(
+        "--with-flops",
+        action="store_true",
+        help="Estimate FLOPs for supported operators.",
+    )
+    parser.add_argument(
+        "--worker-name",
+        default=None,
+        help="Worker name prefix in the TensorBoard trace files.",
+    )
+    parser.add_argument(
+        "--time-limit-seconds",
+        type=float,
+        default=120.0,
+        help=(
+            "Stop the profiled run after this many seconds and write the trace. "
+        ),
+    )
+    parser.add_argument("script", help="Path to the Python script to run.")
+    parser.add_argument(
+        "script_args",
+        nargs=argparse.REMAINDER,
+        help="Arguments passed through to the target script.",
+    )
+    args = parser.parse_args()
+
+    if args.script_args and args.script_args[0] == "--":
+        args.script_args = args.script_args[1:]
+
+    return args
+
+
+class ProfileTimeLimitExceeded(TimeoutError):
+    """Raised when the user-requested profiling time limit is reached."""
+
+
+@contextmanager
+def profiling_time_limit(seconds: float | None):
+    if seconds is None:
+        yield
+        return
+
+    if seconds <= 0:
+        raise ValueError("--time-limit-seconds must be greater than 0.")
+    if not hasattr(signal, "SIGALRM"):
+        raise RuntimeError(
+            "--time-limit-seconds is unsupported on this platform (missing SIGALRM)."
+        )
+
+    def _timeout_handler(_signum, _frame):
+        raise ProfileTimeLimitExceeded()
+
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    signal.signal(signal.SIGALRM, _timeout_handler)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0.0)
+        signal.signal(signal.SIGALRM, previous_handler)
+
+
+def default_worker_name() -> str:
+    rank = os.getenv("RANK")
+    local_rank = os.getenv("LOCAL_RANK")
+    if rank is not None:
+        return f"rank{rank}-pid{os.getpid()}"
+    if local_rank is not None:
+        return f"local_rank{local_rank}-pid{os.getpid()}"
+    return f"pid{os.getpid()}"
+
+
+def run_target_script(script: str, script_args: list[str]) -> None:
+    script_path = Path(script).resolve()
+    if not script_path.is_file():
+        raise FileNotFoundError(f"Script not found: {script_path}")
+
+    script_dir = str(script_path.parent)
+    inserted_path = False
+    if script_dir not in sys.path:
+        sys.path.insert(0, script_dir)
+        inserted_path = True
+
+    original_argv = sys.argv[:]
+    try:
+        sys.argv = [str(script_path), *script_args]
+        runpy.run_path(str(script_path), run_name="__main__")
+    finally:
+        sys.argv = original_argv
+        if inserted_path and sys.path and sys.path[0] == script_dir:
+            sys.path.pop(0)
+
+
+def main() -> None:
+    args = parse_args()
+
+    logdir = Path(args.logdir).resolve()
+    logdir.mkdir(parents=True, exist_ok=True)
+
+    activities = [ProfilerActivity.CPU]
+    if not args.cpu_only and torch.cuda.is_available():
+        activities.append(ProfilerActivity.CUDA)
+    elif not args.cpu_only:
+        print("CUDA is unavailable. Profiling CPU activity only.", file=sys.stderr)
+
+    worker_name = default_worker_name()
+    if args.worker_name:
+        worker_name = f'{args.worker_name}_{worker_name}'
+    trace_handler = tensorboard_trace_handler(str(logdir), worker_name=worker_name)
+
+    script_error = None
+    timed_out = False
+    with profile(
+        activities=activities,
+        record_shapes=args.record_shapes,
+        profile_memory=args.profile_memory,
+        with_stack=args.with_stack,
+        with_flops=args.with_flops,
+    ) as prof:
+        try:
+            with profiling_time_limit(args.time_limit_seconds):
+                run_target_script(args.script, args.script_args)
+        except ProfileTimeLimitExceeded:
+            timed_out = True
+        except BaseException as exc:
+            script_error = exc
+
+    trace_handler(prof)
+
+    if script_error is not None:
+        raise script_error
+
+    print(f"Profiler trace written to: {logdir}")
+    print(f"Open TensorBoard with: tensorboard --logdir {logdir}")
+    print("TensorBoard PyTorch profiler plugin is required: pip install torch_tb_profiler")
+    if timed_out:
+        print(
+            f"Stopped profiling after {args.time_limit_seconds} seconds by request.",
+            file=sys.stderr,
+        )
+
+
+if __name__ == "__main__":
+    main()

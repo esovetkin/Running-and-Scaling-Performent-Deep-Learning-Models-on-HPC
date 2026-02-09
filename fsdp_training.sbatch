@@ -40,22 +40,31 @@ source ./sc_venv_template_HPC_supporter_course/activate.sh
 # If you create a new virtual environment, you should update the path above and activate yours.
 export PYTHONPATH="${PYTHONPATH}:$(pwd)"
 module load tensorboard
-# Launch a distributed training job across multiple nodes and GPUs
-PROFILE=false
 
-# Parse args
+# Launch a distributed training job across multiple nodes and GPUs.
+# Modes:
+#   none   -> normal run
+#   nsys   -> run_profile.sh (nsys)
+#   torch  -> run_torchprofile (torch.profiler)
+PROFILE_MODE=none
 for arg in "$@"; do
-    case $arg in
+    # Parse args (first profiling flag wins)
+    case "$arg" in
         --profile)
-            PROFILE=true
-            shift
+            if [ "$PROFILE_MODE" = "none" ]; then
+                PROFILE_MODE=nsys
+            fi
+            ;;
+        --torch_profile)
+            if [ "$PROFILE_MODE" = "none" ]; then
+                PROFILE_MODE=torch
+            fi
             ;;
     esac
 done
 
-if [ "$PROFILE" = true ]; then
-    echo "Running with NSYS profiling..."
-    
+if [ "$PROFILE_MODE" = "nsys" ]; then
+    echo "Running with NSYS profiling (run_profile.sh)..."
     mkdir -p nsys_logs
     srun env -u CUDA_VISIBLE_DEVICES bash -c 'torchrun \
        --nproc-per-node=gpu \
@@ -67,6 +76,27 @@ if [ "$PROFILE" = true ]; then
        --local-addr="$(if ((SLURM_NODEID)); then echo $MASTER_ADDR; else hostname; fi)" \
        --no-python ./run_profile.sh train/fsdp_training.py --profile'
 
+elif [ "$PROFILE_MODE" = "torch" ]; then
+    echo "Running with torch.profiler (run_torchprofile)..."
+    mkdir -p "$TORCH_PROFILE_LOGDIR"
+    srun env -u CUDA_VISIBLE_DEVICES bash -c 'torchrun \
+       --nproc-per-node=gpu \
+       --nnodes="$SLURM_JOB_NUM_NODES" \
+       --rdzv-id="$SLURM_JOB_ID" \
+       --rdzv-endpoint="$MASTER_ADDR":"$MASTER_PORT" \
+       --rdzv-backend=c10d \
+       --rdzv-conf=is_host="$(if ((SLURM_NODEID)); then echo 0; else echo 1; fi)" \
+       --local-addr="$(if ((SLURM_NODEID)); then echo $MASTER_ADDR; else hostname; fi)" \
+       --no-python python run_torchprofile \
+                          --logdir runs/fsdp \
+                          --worker-name fsdp \
+                          --time-limit-seconds 120 \
+                          --profile-memory \
+                          --record-shapes \
+                          --with-flops \
+                          --with-stack \
+                          train/fsdp_training.py --profile'
+
 else
     echo "Running without profiling..."
     srun env -u CUDA_VISIBLE_DEVICES bash -c 'torchrun \
@@ -77,5 +107,5 @@ else
        --rdzv-backend=c10d \
        --rdzv-conf=is_host="$(if ((SLURM_NODEID)); then echo 0; else echo 1; fi)" \
        --local-addr="$(if ((SLURM_NODEID)); then echo $MASTER_ADDR; else hostname; fi)" \
-        train/fsdp_training.py'
+       train/fsdp_training.py'
 fi
